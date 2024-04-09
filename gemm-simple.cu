@@ -11,19 +11,33 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
 
   using namespace cute;
 
+  // 把传入的原始指针（一维连续内存），转为逻辑上的cute_tensor
+  // mk个连续元素，表示为逻辑上的(m,k):(k,1), 行主序。逻辑上行表示的元素连续。不同行stride=k
   Tensor A = make_tensor(make_gmem_ptr(Aptr), make_shape(m, k), make_stride(k, Int<1>{}));
+  // nk个连续元素，表示为逻辑上的(n,k):(k:1), 同样行主序。（如果算乘法的话，是转置后的(k:n)。以(K,N)看，（列主序）。指令要求的是以(K,N看)）  
   Tensor B = make_tensor(make_gmem_ptr(Bptr), make_shape(n, k), make_stride(k, Int<1>{}));
+  // mn个连续元素，用于写入，表示为逻辑上的(m,n):(n,1)， 行主序
   Tensor C = make_tensor(make_gmem_ptr(Cptr), make_shape(m, n), make_stride(n, Int<1>{}));
 
+  // 本cudablock,处理C中（kTileM，kTileN)大小的块，对应的完整矩阵乘
   int ix = blockIdx.x;
   int iy = blockIdx.y;
 
-  Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(iy, _));
-  Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(ix, _));
+
+  // 得到一个cudablock要处理的任务：
+  // C中小块：(kTileM, kTileN)
+  // 原始矩阵C，用(kTileM,kTileN)模式(左上角)，划分成多个tile. 取出该cudablock对应的tile (对应的逻辑Tensor)
   Tensor gC = local_tile(C, make_tile(Int<kTileM>{}, Int<kTileN>{}), make_coord(iy, ix));
-  //  gA(kTileM, kTileK, num_tile_k)
-  //  gB(kTileN, kTileK, num_tile_k)
-  //  gC(kTileM, kTileN) 
+  // 原始矩阵A,用(kTileM,kTileK)模式，划分成多个tile
+  //          取M维度上，该block对应iy行的所有块。对应（TileM,K） 。 此时K轴也被切分，全取，待迭代
+  Tensor gA = local_tile(A, make_tile(Int<kTileM>{}, Int<kTileK>{}), make_coord(iy, _));
+  // 原始矩阵B(N,K),用(kTileN,kTileK)模式，划分成多个tile
+  //          取N维度上，ix个整块。对应（TileN,K）。此时K轴也被切分，全取，待迭代
+  Tensor gB = local_tile(B, make_tile(Int<kTileN>{}, Int<kTileK>{}), make_coord(ix, _));
+
+  //  gA(kTileM, kTileK, num_tile_k)   最后一维K，已经按kTileK分块了
+  //  gB(kTileN, kTileK, num_tile_k)   最后一维K，已经按kTileK分块了
+  //  gC(kTileM, kTileN)               本cudablock要处理的C小块
 
   TiledMMA tiled_mma;
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
@@ -74,23 +88,44 @@ int main() {
   gen_rand_data(Aptr_host, m * k);
   gen_rand_data(Bptr_host, n * k);
 
+  // 初始化global mem上的A(m.k),B(kn)
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * m * k, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
-  using mma_op = SM80_16x8x16_F16F16F16F16_TN;
+  // 使用的mma指令是： mnk_16816,  即A对应16,16   B对应16*8  C对应16，8 
+  // 32个线程。 atom TN: 要求A转置(行主序)，B不转置（以(K,N)看,列主序）
+  using mma_op = SM80_16x8x16_F16F16F16F16_TN;   
   using mma_traits = MMA_Traits<mma_op>;
   using mma_atom = MMA_Atom<mma_traits>;
 
+  // tiledMMA
+  // 拓展出(2,2,1)，同时拓展对应线程。拓展出128个线程
+  // 128个线程，可以计算32_32_16的矩阵乘. 
   using MMA = decltype(make_tiled_mma(mma_atom{}, 
-                      make_layout(Shape<_2, _2, _1>{}), 
-                      make_layout(Shape<_1, _2, _1>{})));
+                      // 拓展出4个atom: (2,2,1)，对应128个线程. MN都*2，可以计算32_16_16的矩阵乘。4个warp
+                      make_layout(Shape<_2, _2, _1>{}),  
+                      // N方向，元素数目拓展2倍，负责更多的数据。
+                      // 线程数目不变，直接映射过去。原来32，现在64，可以计算32_32_16的矩阵乘. 每个线程算更多元素
+                      make_layout(Shape<_1, _2, _1>{})));// 
+
+  // cudablock粒度分块，每个cudablock,处理一个(kTileM=128,kTileN=128)的C中小块
+  // slice-K: K轴按照3kTileK切块，AB沿K轴的块迭代，每次取出第k个小块，计算后累加到本block处理的C中小块上
   constexpr int kTileM = 128; 
   constexpr int kTileN = 128; 
   constexpr int kTileK = 32; 
+  // C(m.n), 划分为（kTileM，kTileN)大小的块。
+  // 从而根据原来大矩阵C的规模，设定分块数目
+  // 每个cudablock,处理C中（kTileM，kTileN)大小的完整矩阵乘
+  dim3 grid(n / kTileN, m / kTileM); 
 
+  // 每个block, 分配32_32_16个线程，处理(128,128)大小的C块
   dim3 block(size(MMA{}));
-  dim3 grid(n / kTileN, m / kTileM);
+  printf("size(MMA{}):%d\n",size(MMA{}));
+
+
   for (int i = 0; i < 100; ++i) {
+    // 调用，传入A,B,C的原始gloabal mem指针
+    // 分块大小，指定的MMA。作为模板参数传入
     gemm_simple<T, kTileM, kTileN, kTileK, MMA><<<grid, block>>>(Cptr, Aptr, Bptr, m, n, k);
   }
   cudaDeviceSynchronize();
@@ -162,3 +197,7 @@ void gen_rand_data(T *data, int n) {
     data[i] = v;
   }
 }
+
+
+// make
+// size(MMA{})
