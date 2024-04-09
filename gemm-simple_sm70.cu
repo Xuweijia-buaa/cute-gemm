@@ -39,9 +39,13 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   //  gB(kTileN, kTileK, num_tile_k)   最后一维K，已经按kTileK分块了
   //  gC(kTileM, kTileN)               本cudablock要处理的C小块
 
-  // 实例化一个tiled_mma, 可以一次处理32_32_16的矩阵乘
+  // 实例化一个tiled_mma, 可以处理32_32_16的矩阵乘
   TiledMMA tiled_mma;
+
+  
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+  // 从gA(kTileM=128, kTileK=32, num_tile_k)中，抽取该线程负责的块
+
   // 对tileMMA来说， 
   // 每个MMAAtom 16*8*16中，对应32个线程，
   //    A矩阵（M,k）：
@@ -50,61 +54,35 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   // tileMMA:
   //    Atom拓展：在M方向拓展2，N方向拓展2，但线程也拓展。每个线程处理的线程和逻辑layout不变
   //    Value拓展：只在N方向拓展，因此每个线程对应的线程和逻辑layout也不变
-  // 对一次tileMMA来说：
-  //    一次tilemma计算，对应一次32*32*16的矩阵乘。（128个线程）
-  //    需要提供的A大小是（32，16）    （64个线程）
-  //    其中每个线程处理A中8个元素,对应一定的layout    ~~
 
-  // 以A为例：
-  // 本cudablock，需要处理是a大小是：gA(kTileM=128, kTileK=32, num_tile_k),对应K轴的所有块
-  //             A中每个分块大小是(kTileM=128,kTileK=32),
-  // 需要(4,2)次tilemma计算，才能算完. 每次算(32,16)
+  // 对ga(128,32),按线程进行分块，
 
-  // partition_A，对gA的前2维(128,32)进行划分,提供该线程需要读取到寄存器中的数据
-  // 首个维度是本线程，执行一次tiledMMA需要处理的元素(2,2,2)数目，对应一次tiledMMA计算
-  //    The first mode, `MMA`, of the result tensors hold all of the elements that a single instruction will consume
-  // 第2，3个维度，对应ga的前2为对应的块(128,32),共需要几次MMA计算。
-  //    这里gA的前2维(128,32), 一共需要(4,2)次mma计算.
-  // 因此最终得到的tgaA的前3个维度是：
-  //    （(2,2,2),4,2）
-  //     代表本线程每次提供8个元素，进行一次tilemma计算（对应一次323216的矩阵乘），共需要沿(M=4,K=2)方向读取8次，才能计算一个完整的Ak块。
-  //     即ga(tileM,tileK,*) -> (thread_single_MMA_element,MMa_num_M, MMA_num_K,*), 拆成多次tiileMMA计算
-  //     只对ga Tensor的前两维进行划分(M,K.*)
+  // 对Tensor的前两维进行划分(M,K.*)
   // 划分成3个维度（本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数），对应tiledMMA,
-  // (MMA, MMA_M, MMA_K, num_tile_k)->
-  //（单次MMA本线程需提供的元素（对应的layout），在M维重复次数，在K维重复次数(以计算多个mma,算完ga前2维对应的块）, ga所含的其他维度）
-  // ((2,2,2),4,2,8)
-  auto tAgA = thr_mma.partition_A(gA);  // (MMA, MMA_M, MMA_K, num_tile_k)->（单次MMA计算本线程需提供的元素（对应的layout），在M维重复次数，在K维重复次数，以计算完整个ga的一个小块）
-  // 对B分块，类似，得到算完B中小块Bk,(线程需要提供的数据，和在N维，K维的迭代次数)，以算完一次gB的(kTileN, kTileK)
+  // (本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数,*)
+  // ((2,2,2),4,2,8): 
+  auto tAgA = thr_mma.partition_A(gA);  // (MMA, MMA_M, MMA_K, num_tile_k)
+
+
   auto tBgB = thr_mma.partition_B(gB);  // (MMA, MMA_N, MMA_K, num_tile_k)
   auto tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
-  
-  // 上边的数据，仍在global mem中。
-  // 但我们迭代时，ga,gb中的小块，每次都放到寄存器上，才能给TensorCore算
-  // 把划分的逻辑结果，放到本线程的寄存器上
-  // 仍是本线程每个mma操作，（需要提供的(数据)，以及迭代完该小块，对应的M,N需要拓展的维度）
-  // 每个线程的寄存器，提供一部分数据，但所有线程一起，提供一次mma所需的数据，进行一次TensorCore上的tilemma操作。
-  // M维，N维拓展后，可以迭代完一个（kTileM=128, kTileK=32）大小的块
-  auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)  slice_ga, 输入shape是（kTileM=128, kTileK=32）
+
+  auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
   auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
   auto tCrC = thr_mma.partition_fragment_C(gC(_, _));     // (MMA, MMA_M, MMA_N)
  
-  clear(tCrC);// 每个线程的寄存器，清空为0，
+  clear(tCrC);
   
   int num_tile_k = size<2>(gA);
 #pragma unroll 1
   for(int itile = 0; itile < num_tile_k; ++itile) {  
     // 沿着K轴迭代
-    // 把本线程global mem中的内容，复制到本线程的寄存器上。(mma,M,N)
-    // 128个线程一起，可以完成拓展了M维，N维的MN次tiled MMA计算，算完K轴一个小块
-    cute::copy(tAgA(_, _, _, itile), tArA);  // tAgA(_, _, _, itile): k轴的k小块数据。对应的本线程数据(MMA,MMA_M,MMA_K)
+    cute::copy(tAgA(_, _, _, itile), tArA);
     cute::copy(tBgB(_, _, _, itile), tBrB);
 
-    cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC); // 算完gc K轴中一个小块： M维，N维的MN次tiled MMA,结果写入tCrC。 每个寄存器放一部分
+    cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
   }
 
-  // K轴迭代结束后，cudablock中负责的C中该小块，结果正确。结果累积在寄存器中 （D=A*B+C,其中D==C，累加）
-  // 复制回global_mem. 完成该cudablock的任务
   cute::copy(tCrC, tCgC); 
 }
 
@@ -140,7 +118,8 @@ int main() {
   // 使用的mma指令是： mnk_16816,  即A对应16,16   B对应16*8  C对应16，8 
   // 32个线程。 atom TN: 要求A转置(行主序)，B不转置（以(K,N)看,列主序）
   // 对A: 32个线程，读取16*16个元素，每个线程读取一定分布下的8个元素 （后续N拓展，不影响A的TVlayout）
-  using mma_op = SM80_16x8x16_F16F16F16F16_TN;   
+  //using mma_op = SM80_16x8x16_F16F16F16F16_TN; 
+  using mma_op = SM70_8x8x4_F16F16F16F16_TN;      // 变成（8，4）（4，8）-》（8，8）
   using mma_traits = MMA_Traits<mma_op>;
   using mma_atom = MMA_Atom<mma_traits>;
 
@@ -246,4 +225,4 @@ void gen_rand_data(T *data, int n) {
 
 
 // make
-// size(MMA{})
+// ./gemm-simple_sm70
