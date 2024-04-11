@@ -55,27 +55,64 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   // 对Tensor的前两维进行划分(M,K.*)
   // 划分成3个维度（本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数），对应tiledMMA,
   // (本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数,*)
-  // 
+  // partition后，既按照原始块的大小划分，也按照tileMMA划分，拆成mma_atom粒度，和M,K维度的拓展（该线程涉及到的）
   auto tAgA = thr_mma.partition_A(gA);  // (MMA, MMA_M, MMA_K, num_tile_k)
+  // 一次mma atom,需要A(8,4), 需要本线程提供4个元素
+  // 一次tileMMA, 本身在M维拓展2倍(拓展线程)，K维不拓展  需要A(16,4)。本线程需要提供4个元素
+  // 原始要划分的ga一个块大小为(128,32)，对应M维，K维拓展出的(8,8)个tiledmma，对应(16,8)个atom_mma,但其中一半M，不需要使用本线程
+  // 因此本线程每次mma_atom提供4个元素，共(MMA_M=8,MMA_K=8)次。提供所有寄存器对应的元素
   //print(gA);
   // if (tidx==0 && ix==0 && iy==0){
+  //   // gmem_ptr[16b](0x7f6558000000) o (_4,_8,_8,8):(_1,4096,_4,_32)
   //   print(tAgA);
   // }
-     //print(cute::rank<>(tAgA));
-     //print(tAgA);
+  //print(cute::rank<>(tAgA));
+  //print(tAgA);
 
 
   auto tBgB = thr_mma.partition_B(gB);  // (MMA, MMA_N, MMA_K, num_tile_k)
+  // 总的gb(N=128,K=32)
+  // 一次mma atom,需要B(8,4), 其中需要本线程提供4个元素
+  // 一次tileMMA, 本身在N维拓展2(拓展线程)*2（拓展value），K维不拓展  需要B(32,4)。本线程需要提供8个元素
+  // 总的一块gb（128，32）， 可以沿着N,K维划分为(4,8)个tilemma, 对应(16,8)个mma atom. 其中N维只有拓展value的部分，需要本线程提供元素，拓展线程部分不需要
+  // 因此本线程为每次mma_atom提供4个元素，共(MMA_M=8,MMA_K=8)次。可以算完整个gb。
   //print(gB);
-  //print_tensor(tBgB);
+  // if (tidx==0 && ix==0 && iy==0){
+  //   // gmem_ptr[16b](0x7f226a800000) o (_4,_8,_8,8):(_1,4096,_4,_32)
+  //   print(tBgB);
+  // }
+  //print(tBgB);
 
   auto tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
+  // 总的gc(128,128)
+  // 每个atom,需要C(8,8)。8个线程，每个线程读取一定分布下的8个元素
+  // 一次tileMMA, 本身在M(拓展线程2)，N维拓展2(拓展线程)*2（拓展value）。对应C(16,32)。 只有N维度拓展value, 其他MN维度拓展的2，不归本线程
+  // 总的gc(128,128),可以划分为(8,4)个tiledmma，对应(2*8，2*2*4)个mma。其中本线程不处理拓展线程的，只处理(8,2*4)个mma
+  // 因此是本线程负责计算的mma_atoms，在M维，N维拓展(8,2*4)，既包含tileamma对应的拓展，也包含gc拆分对应的拓展，合成一个大的新tileMMA
+  // 只参与该线程负责的计算。每次mma_atom计算8个元素
   //print(gC);
   //print(tCgC);
+  // if (tidx==0 && ix==0 && iy==0){
+  //   //gmem_ptr[16b](0x7fddec000000) o (_8,_8,_8):(_1,4096,_16)
+  //   print(tCgC);
+  // }
 
   auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
+  if (tidx==0 && ix==0 && iy==0){
+    //ptr[16b](0x7f9ce4fff030) o (_4,_8,_8):(_1,_4,_32)
+    print(tArA);
+  }
+
   auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
+  // if (tidx==0 && ix==0 && iy==0){
+  //   //ptr[16b](0x7fc4e6fff050) o (_4,_8,_8)：(_1,_4,_32)
+  //   print(tBrB);
+  // }
   auto tCrC = thr_mma.partition_fragment_C(gC(_, _));     // (MMA, MMA_M, MMA_N)
+  // if (tidx==0 && ix==0 && iy==0){
+  //   //ptr[16b](0x7fcdd0fff6b0) o (_8,_8,_8):(_1,_8,_64)
+  //   print(tCrC);
+  // }
  
   clear(tCrC);
   
