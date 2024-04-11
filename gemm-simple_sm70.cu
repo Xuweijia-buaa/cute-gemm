@@ -23,6 +23,10 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   int ix = blockIdx.x;
   int iy = blockIdx.y;
 
+  int tidx= threadIdx.x;
+  //printf("blockDim.x %d,blockDim.y %d ",blockDim.x,blockDim.y);// 32,1 只用了所需要的32个线程
+
+
 
   // 得到一个cudablock要处理的任务：
   // C中小块：(kTileM, kTileN)
@@ -46,26 +50,28 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   auto thr_mma = tiled_mma.get_slice(threadIdx.x);
   // 从gA(kTileM=128, kTileK=32, num_tile_k)中，抽取该线程负责的块
 
-  // 对tileMMA来说， 
-  // 每个MMAAtom 16*8*16中，对应32个线程，
-  //    A矩阵（M,k）：
-  //    32个线程，处理(16*16)的A矩阵
-  //    每个线程，可以处理(16,16)的A矩阵中的8个元素（对应一定的layout）  
-  // tileMMA:
-  //    Atom拓展：在M方向拓展2，N方向拓展2，但线程也拓展。每个线程处理的线程和逻辑layout不变
-  //    Value拓展：只在N方向拓展，因此每个线程对应的线程和逻辑layout也不变
 
   // 对ga(128,32),按线程进行分块，
-
   // 对Tensor的前两维进行划分(M,K.*)
   // 划分成3个维度（本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数），对应tiledMMA,
   // (本线程一次喂给MMA计算所需要的元素（对应的layout），在M维重复次数，在K维重复次数,*)
-  // ((2,2,2),4,2,8): 
+  // 
   auto tAgA = thr_mma.partition_A(gA);  // (MMA, MMA_M, MMA_K, num_tile_k)
+  //print(gA);
+  // if (tidx==0 && ix==0 && iy==0){
+  //   print(tAgA);
+  // }
+     //print(cute::rank<>(tAgA));
+     //print(tAgA);
 
 
   auto tBgB = thr_mma.partition_B(gB);  // (MMA, MMA_N, MMA_K, num_tile_k)
+  //print(gB);
+  //print_tensor(tBgB);
+
   auto tCgC = thr_mma.partition_C(gC);  // (MMA, MMA_M, MMA_N)
+  //print(gC);
+  //print(tCgC);
 
   auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
   auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
@@ -79,6 +85,9 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
     // 沿着K轴迭代
     cute::copy(tAgA(_, _, _, itile), tArA);
     cute::copy(tBgB(_, _, _, itile), tBrB);
+
+    //print_tensor(tArA);
+    //print_tensor(tBrB);
 
     cute::gemm(tiled_mma, tCrC, tArA, tBrB, tCrC);
   }
@@ -115,22 +124,28 @@ int main() {
   cudaMemcpy(Aptr, Aptr_host, sizeof(T) * m * k, cudaMemcpyHostToDevice);
   cudaMemcpy(Bptr, Bptr_host, sizeof(T) * n * k, cudaMemcpyHostToDevice);
 
-  // 使用的mma指令是： mnk_16816,  即A对应16,16   B对应16*8  C对应16，8 
-  // 32个线程。 atom TN: 要求A转置(行主序)，B不转置（以(K,N)看,列主序）
-  // 对A: 32个线程，读取16*16个元素，每个线程读取一定分布下的8个元素 （后续N拓展，不影响A的TVlayout）
+  // 使用的mma指令是： mnk_884,  即A对应(84)   B对应(48)  C对应(88)
+  // atom: 8个线程TN: 要求A转置(行主序)，B不转置（以(K,N)看,列主序）
+  // 对A(8,4): 8个线程，每个线程读取一定分布下的4个元素 （后续N拓展，不影响A的TVlayout）
+  // 对B(4,8): 8个线程，每个线程读取一定分布下的4个元素
+  // 对C(8,8): 8个线程，每个线程读取一定分布下的8个元素
+  // tile后，可以计算16_32_4的矩阵乘。32个线程
+  //  对A(16,4): 16个线程，每个线程读取一定分布下的4个元素
+  //  对B(4,32): 16个线程，每个线程读取8个元素
+  //  对C(16,32):32个线程，每个线程读取16个元素
   //using mma_op = SM80_16x8x16_F16F16F16F16_TN; 
   using mma_op = SM70_8x8x4_F16F16F16F16_TN;      // 变成（8，4）（4，8）-》（8，8）
   using mma_traits = MMA_Traits<mma_op>;
   using mma_atom = MMA_Atom<mma_traits>;
 
   // tiledMMA
-  // 拓展出(2,2,1)，同时拓展对应线程。拓展出128个线程
+  // 拓展出(2,2,1)，同时拓展对应线程。拓展出32个线程
   // 128个线程，可以计算32_32_16的矩阵乘. 
   using MMA = decltype(make_tiled_mma(mma_atom{}, 
-                      // 拓展出4个atom: (2,2,1)，对应128个线程. MN都*2，可以计算32_16_16的矩阵乘。4个warp
+                      // 拓展出4个atom: (2,2,1)，对应32个线程. MN都*2，可以计算16_16_4的矩阵乘
                       make_layout(Shape<_2, _2, _1>{}),  
                       // N方向，元素数目拓展2倍，负责更多的数据。
-                      // 线程数目不变，直接映射过去。原来32，现在64，可以计算32_32_16的矩阵乘. 每个线程算更多元素
+                      // 线程数目不变，直接映射过去。原来16，现在32，可以计算16_32_4的矩阵乘. 每个线程算更多元素
                       make_layout(Shape<_1, _2, _1>{})));// 
 
   // cudablock粒度分块，每个cudablock,处理一个(kTileM=128,kTileN=128)的C中小块
@@ -145,7 +160,7 @@ int main() {
 
   // 每个block, 分配32_32_16个线程，处理(128,128)大小的C块
   dim3 block(size(MMA{}));
-  printf("size(MMA{}):%d\n",size(MMA{}));
+  printf("size(MMA{}):%d\n",size(MMA{})); // 131072
 
 
   for (int i = 0; i < 100; ++i) {
@@ -211,8 +226,8 @@ int main() {
   Tensor tc1 = local_tile(tensor_C, tile, coor);
   Tensor tc1_cublas = local_tile(tensor_C_cublas, tile, coor);
 
-  print_tensor(tc1);
-  print_tensor(tc1_cublas);
+  // print_tensor(tc1);
+  // print_tensor(tc1_cublas);
 }
 
 template <typename T>
