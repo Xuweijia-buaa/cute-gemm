@@ -24,7 +24,16 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   int iy = blockIdx.y;
 
   int tidx= threadIdx.x;
-  //printf("blockDim.x %d,blockDim.y %d ",blockDim.x,blockDim.y);// 32,1 只用了所需要的32个线程
+  // blockDim.x 32,blockDim.y 1 blockDim.z 1 
+  // 一个cudablock,只用了个32个线程
+  // 每个线程，提供计算该cudablock的每个小块C时，
+  //         涉及到的mma_atom的所有数据(对应的寄存器）
+  //         每个mma_atom对应一条指令，（M,N）维拓展后，一个小块C的计算，共需要MN个atom指令
+  //         对应K轴，一次cute::gemm的计算。
+  if (tidx==0 && ix==0 && iy==0){
+    printf("blockDim.x %d,blockDim.y %d blockDim.z %d \n",blockDim.x,blockDim.y,blockDim.z);
+  }
+
 
 
 
@@ -97,11 +106,17 @@ __global__ void gemm_simple(T *Cptr, const T *Aptr, const T *Bptr, int m, int n,
   //   print(tCgC);
   // }
 
-  auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)
-  if (tidx==0 && ix==0 && iy==0){
-    //ptr[16b](0x7f9ce4fff030) o (_4,_8,_8):(_1,_4,_32)
-    print(tArA);
-  }
+  // 本线程计算一个小块C时，需要提供的全部数据（对应的寄存器），对应一次cute::gemm的计算。
+  // 每次cute::gemm计算，完整一个小块C的完整计算
+  // 拆分后，对应多个mma_atom的计算，每个mma_atom对应一条指令
+  // 其中每个线程，参与其中部分mma_atom的计算，且在M维N维分别拓展M,N次，对应该线程共参与MN次MMA atom的计算，共同构成一个新的tileMMA计算
+  // 这里提供本线程参与该新的tileMMA计算时，需要提供的所有寄存器数据：
+  // 含每次mma_atom本线程需要提供的数据，和本线程参与的多次MMA计算(M,N)计算，以共同完成原始块C的计算
+  // (本线程一次mma_atom计算需要提供数据，和本线程参与的MMA_atom计算次数，在M维，N维的拓展)。本线程本次cute::gemm计算，共需参与MN次mma_atom计算
+  auto tArA = thr_mma.partition_fragment_A(gA(_, _, 0));  // (MMA, MMA_M, MMA_K)  本线程参与每次cute_gemm计算，需要提供的寄存器中的数据，对应多次MMA_atom计算
+  // if (tidx==0 && ix==0 && iy==0){
+  //   print(tArA);    //ptr[16b](0x7f9ce4fff030) o (_4,_8,_8):(_1,_4,_32)
+  // }
 
   auto tBrB = thr_mma.partition_fragment_B(gB(_, _, 0));  // (MMA, MMA_N, MMA_K)
   // if (tidx==0 && ix==0 && iy==0){
